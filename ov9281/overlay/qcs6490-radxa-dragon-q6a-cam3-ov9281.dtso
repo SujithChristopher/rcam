@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * OV9281 on CAM3. Same as the CAM2 variant but routed to:
+ *   cci1 / cci1_i2c1, CSIPHY port@3, power-enable on gpio78.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	metadata {
+		title = "Enable Waveshare OV9281 camera on CAM3";
+		compatible = "radxa,dragon-q6a";
+		category = "camera";
+		exclusive = "cci1_i2c1";
+		description = "Enable Waveshare OV9281 mono global-shutter camera on CAM3.";
+	};
+};
+
+&{/} {
+	ext_cam_clk_ov9281_1: ext-cam-clk-ov9281-1 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_ov9281_1";
+		#clock-cells = <0>;
+	};
+
+	camera_pwdn_gpio_1: camera-pwdn-gpio-1 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_1";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&tlmm 78 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_1>;
+	};
+};
+
+&{/reserved-memory} {
+	linux,cma {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x8000000>;
+		reusable;
+		linux,cma-default;
+	};
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l10c_0p88>;
+	vdda-pll-supply = <&vreg_l6b_1p2>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* The port index denotes CSIPHY id i.e. csiphy3 */
+		port@3 {
+			reg = <3>;
+
+			csiphy3_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&ov9281_1_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&cci1_i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@60 {
+		compatible = "ovti,ov9281";
+		reg = <0x60>;
+
+		clocks = <&ext_cam_clk_ov9281_1>;
+
+		avdd-supply = <&vph_pwr>;
+		dovdd-supply = <&vph_pwr>;
+		dvdd-supply = <&vph_pwr>;
+
+		port {
+			ov9281_1_ep: endpoint {
+				link-frequencies = /bits/ 64 <400000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam_pwdn_gpio_1: cam-pwdn-gpio-1-state {
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};

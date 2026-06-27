@@ -1,0 +1,26 @@
+# Kernel module build artifacts
+ov9281/module/*.o
+ov9281/module/*.ko
+ov9281/module/*.mod
+ov9281/module/*.mod.c
+ov9281/module/*.mod.o
+ov9281/module/.*.cmd
+ov9281/module/*.symvers
+ov9281/module/*.order
+ov9281/module/.tmp_versions/
+ov9281/module/modules.order
+
+# Compiled device-tree blobs (regenerated from .dtso sources)
+*.dtbo
+*.dtb
+
+# Captured frames are large; keep sources, not data
+ov9281/captures/*.raw
+ov9281/captures/*.pgm
+ov9281/captures/*.png
+
+# Downloaded reference pages: keep the .html, drop the heavy asset dirs
+docs/*_files/
+
+# Claude Code local tooling
+.claude/

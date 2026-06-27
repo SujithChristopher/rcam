@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Enable a Waveshare OV9281 (mono global-shutter) camera on CAM2.
+ *
+ * Adapted from Radxa's qcs6490-radxa-dragon-q6a-cam2-radxa-camera-8m-219.dtso.
+ * Differences vs. the IMX219 reference:
+ *   - sensor compatible "ovti,ov9281" (handled by the ov9282 driver)
+ *   - link-frequencies = 400 MHz (the only rate the ov9282 driver advertises)
+ *   - avdd/dovdd/dvdd supplies wired up (ov9282 requires them, unlike imx219)
+ *   - 2 MIPI data lanes (same as the 8M-219), Y10/Y8 mono output
+ *
+ * CAM2 routing: cci1 / cci1_i2c0, CSIPHY port@2, power-enable on gpio77.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	metadata {
+		title = "Enable Waveshare OV9281 camera on CAM2";
+		compatible = "radxa,dragon-q6a";
+		category = "camera";
+		exclusive = "cci1_i2c0";
+		description = "Enable Waveshare OV9281 mono global-shutter camera on CAM2.";
+	};
+};
+
+&{/} {
+	ext_cam_clk_ov9281: ext-cam-clk-ov9281 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_ov9281";
+		#clock-cells = <0>;
+	};
+
+	/*
+	 * Drives the CAM2 power-enable line (gpio77) high, exactly as the
+	 * 8M-219 overlay does. This releases the sensor reset/XSHUTDN, so the
+	 * ov9282 driver's own (optional) "reset" gpio is intentionally omitted
+	 * to avoid two consumers contending for the same pin.
+	 */
+	camera_pwdn_gpio_0: camera-pwdn-gpio-0 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_0";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&tlmm 77 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_0>;
+	};
+};
+
+&{/reserved-memory} {
+	linux,cma {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x8000000>;
+		reusable;
+		linux,cma-default;
+	};
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l10c_0p88>;
+	vdda-pll-supply = <&vreg_l6b_1p2>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* The port index denotes CSIPHY id i.e. csiphy2 */
+		port@2 {
+			reg = <2>;
+
+			csiphy2_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&ov9281_0_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&cci1_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@60 {
+		compatible = "ovti,ov9281";
+		reg = <0x60>;
+
+		clocks = <&ext_cam_clk_ov9281>;
+
+		/* ov9282 requires these regulator supplies. The CAM connector is
+		 * fed from the board VPH rail; the per-rail LDOs on the camera
+		 * module are enabled by camera_pwdn_gpio_0 above. */
+		avdd-supply = <&vph_pwr>;
+		dovdd-supply = <&vph_pwr>;
+		dvdd-supply = <&vph_pwr>;
+
+		port {
+			ov9281_0_ep: endpoint {
+				link-frequencies = /bits/ 64 <400000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam_pwdn_gpio_0: cam-pwdn-gpio-0-state {
+		pins = "gpio77";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};

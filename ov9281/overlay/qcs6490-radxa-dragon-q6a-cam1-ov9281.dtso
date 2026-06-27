@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Waveshare OV9281 (mono global shutter) on CAM1.
+ *
+ * CAM1 is the only Dragon Q6A connector that routes a real SoC master clock
+ * (CAM_CC_MCLK0 on gpio64). The Waveshare OV9281 is a Raspberry-Pi style module
+ * that needs a host-supplied 24 MHz MCLK, so it must use CAM1 (CAM2/CAM3 only
+ * provide a virtual clock for self-clocking Radxa modules).
+ *
+ * Adapted from qcs6490-radxa-dragon-q6a-cam1-imx577.dtso:
+ *   - compatible ovti,ov9281, I2C 0x60
+ *   - 2 MIPI data lanes (vs 4 for imx577)
+ *   - link-frequencies 400 MHz (the rate the ov9282 driver advertises)
+ *   - avdd/dovdd/dvdd supplies (ov9282 requires them)
+ *   - reset/enable line gpio20 held active by a regulator-fixed (avoids any
+ *     gpiod polarity ambiguity in the driver's optional reset handling)
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/qcom,camcc-sc7280.h>
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	metadata {
+		title = "Enable Waveshare OV9281 camera on CAM1";
+		compatible = "radxa,dragon-q6a";
+		category = "camera";
+		exclusive = "cci0_i2c0";
+		description = "Enable Waveshare OV9281 mono global-shutter camera on CAM1.";
+	};
+};
+
+&{/} {
+	/* Hold the CAM1 reset/XSHUTDN line (gpio20) released so the sensor runs. */
+	camera_en_gpio_cam1: camera-en-gpio-cam1 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_en_gpio_cam1";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam1_en_gpio>;
+	};
+};
+
+&{/reserved-memory} {
+	linux,cma {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x8000000>;
+		reusable;
+		linux,cma-default;
+	};
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l10c_0p88>;
+	vdda-pll-supply = <&vreg_l6b_1p2>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* The port index denotes CSIPHY id i.e. csiphy0 */
+		port@0 {
+			reg = <0>;
+
+			csiphy0_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&ov9281_ep>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	status = "okay";
+};
+
+&cci0_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@60 {
+		compatible = "ovti,ov9281";
+		reg = <0x60>;
+
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clock-rates = <24000000>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam0_mclk>;
+
+		avdd-supply = <&vph_pwr>;
+		dovdd-supply = <&vph_pwr>;
+		dvdd-supply = <&vph_pwr>;
+
+		port {
+			ov9281_ep: endpoint {
+				link-frequencies = /bits/ 64 <400000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam0_mclk: cam0-mclk-state {
+		pins = "gpio64";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam1_en_gpio: cam1-en-gpio-state {
+		pins = "gpio20";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
