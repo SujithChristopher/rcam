@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Two Waveshare OV9281 cameras on the Dragon Q6A simultaneously.
+ *
+ * Extends the verified single-camera wiring with a second OV9281:
+ *   CAM2 path: cci1_i2c0 / CSIPHY2 (port@2), sensor @ 0x60
+ *   CAM3 path: cci1_i2c1 / CSIPHY3 (port@3), sensor @ 0x60
+ * Both sensors are at I2C 0x60 but on separate CCI buses, so no conflict.
+ * Power: both gpio77 and gpio78 are asserted high (verified the modules need
+ * these). Modules self-clock (no host MCLK pin) -> virtual fixed-clocks.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	metadata {
+		title = "Enable two Waveshare OV9281 cameras (CAM2 + CAM3)";
+		compatible = "radxa,dragon-q6a";
+		category = "camera";
+		exclusive = "cci1_i2c0", "cci1_i2c1";
+		description = "Dual Waveshare OV9281 mono global-shutter cameras.";
+	};
+};
+
+&{/} {
+	ext_cam_clk_ov9281_0: ext-cam-clk-ov9281-0 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_ov9281_0";
+		#clock-cells = <0>;
+	};
+
+	ext_cam_clk_ov9281_1: ext-cam-clk-ov9281-1 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_ov9281_1";
+		#clock-cells = <0>;
+	};
+
+	/* Power-enable lines: assert both; gpio77=CAM2-ish, gpio78=CAM3-ish. */
+	camera_pwdn_gpio_0: camera-pwdn-gpio-0 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_0";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&tlmm 77 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_0>;
+	};
+
+	camera_pwdn_gpio_1: camera-pwdn-gpio-1 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_1";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&tlmm 78 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_1>;
+	};
+};
+
+&{/reserved-memory} {
+	linux,cma {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x8000000>;
+		reusable;
+		linux,cma-default;
+	};
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l10c_0p88>;
+	vdda-pll-supply = <&vreg_l6b_1p2>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* cci1_i2c0 pairs with CSIPHY2 (CAM2) */
+		port@2 {
+			reg = <2>;
+
+			csiphy2_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&ov9281_0_ep>;
+			};
+		};
+
+		/* cci1_i2c1 pairs with CSIPHY3 (CAM3) */
+		port@3 {
+			reg = <3>;
+
+			csiphy3_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&ov9281_1_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&cci1_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@60 {
+		compatible = "ovti,ov9281";
+		reg = <0x60>;
+
+		clocks = <&ext_cam_clk_ov9281_0>;
+
+		avdd-supply = <&vph_pwr>;
+		dovdd-supply = <&vph_pwr>;
+		dvdd-supply = <&vph_pwr>;
+
+		port {
+			ov9281_0_ep: endpoint {
+				link-frequencies = /bits/ 64 <400000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
+};
+
+&cci1_i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@60 {
+		compatible = "ovti,ov9281";
+		reg = <0x60>;
+
+		clocks = <&ext_cam_clk_ov9281_1>;
+
+		avdd-supply = <&vph_pwr>;
+		dovdd-supply = <&vph_pwr>;
+		dvdd-supply = <&vph_pwr>;
+
+		port {
+			ov9281_1_ep: endpoint {
+				link-frequencies = /bits/ 64 <400000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam_pwdn_gpio_0: cam-pwdn-gpio-0-state {
+		pins = "gpio77";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	cam_pwdn_gpio_1: cam-pwdn-gpio-1-state {
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};
