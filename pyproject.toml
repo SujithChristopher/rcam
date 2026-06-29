@@ -1,11 +1,20 @@
 [project]
 name = "rcam"
 version = "0.1.0"
-description = "Add your description here"
+description = "picamera2-style access to the OV9281 cameras on the Radxa Dragon Q6A"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.11.0",
+    "maturin>=1.14.1",
+    "numpy>=2.0",
     "opencv-contrib-python>=4.13.0.92",
     "polars>=1.42.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rcam"]

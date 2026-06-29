@@ -19,6 +19,14 @@ ov9281/captures/*.raw
 ov9281/captures/*.pgm
 ov9281/captures/*.png
 
+# Demo capture output (root)
+/cam*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # Downloaded reference pages: keep the .html, drop the heavy asset dirs
 docs/*_files/
 
