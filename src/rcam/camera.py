@@ -27,6 +27,11 @@ import numpy as np
 
 from .topology import CaptureChain, Sensor, parse
 
+try:
+    from . import _native            # Rust mmap reader (releases the GIL)
+except ImportError:                  # not built -> fall back to v4l2-ctl pipe
+    _native = None
+
 # Sensor subdev V4L2 control names (from `v4l2-ctl --list-ctrls` on the ov9281).
 _RAW_CTRLS = {
     "exposure", "analogue_gain", "vertical_blanking", "horizontal_blanking",
@@ -54,8 +59,15 @@ def _label(s: Sensor) -> str:
 class Camera:
     """One OV9281. Resolve by label ('CAM2'/'CAM3'), index (0/1), or i2c id."""
 
-    def __init__(self, cam: str | int = 0, *, media: str = "/dev/media0"):
+    def __init__(self, cam: str | int = 0, *, media: str = "/dev/media0",
+                 native: bool | None = None):
         self.media = media
+        # Use the Rust mmap backend when built (true parallel, no GIL/pipe);
+        # native=False forces the v4l2-ctl subprocess path.
+        self.native = (_native is not None) if native is None else native
+        if native and _native is None:
+            raise RuntimeError("native backend requested but rcam._native not built "
+                               "(run: uv run maturin develop --release)")
         sensors, chains = parse(media)
         if not sensors:
             raise RuntimeError(
@@ -74,6 +86,7 @@ class Camera:
         self.height = 800
         self.bit_depth = 8
         self._proc: subprocess.Popen | None = None
+        self._cap = None                       # _native.Capture when streaming
         self._frame_bytes = self.width * self.height * 10 // 8
 
     @staticmethod
@@ -122,7 +135,7 @@ class Camera:
         if pairs:
             _run(["v4l2-ctl", "-d", self.sensor.subdev,
                   "--set-ctrl", ",".join(pairs)])
-        if settle and self._proc is not None:
+        if settle and (self._proc is not None or self._cap is not None):
             self.flush()
         return self
 
@@ -178,16 +191,23 @@ class Camera:
             _run(["media-ctl", "-d", m, "-V", f"{pad} {fmt}"])
 
     def start(self):
-        if self._proc is not None:
+        if self._proc is not None or self._cap is not None:
+            return self
+        if shutil.which("media-ctl") is None:
+            raise RuntimeError("media-ctl not found (install v4l-utils)")
+        self._setup_pipeline()
+        if self.native:
+            # Rust mmap reader: opens the video node, sets Y10P, drives the
+            # buffer queue itself. DQBUF/unpack/QBUF run with the GIL released,
+            # so two cameras on two threads capture truly in parallel.
+            self._cap = _native.Capture(self.chain.video, self.width, self.height)
             return self
         if shutil.which("v4l2-ctl") is None:
             raise RuntimeError("v4l2-ctl not found (install v4l-utils)")
-        self._setup_pipeline()
         _run(["v4l2-ctl", "-d", self.chain.video,
               "-v", f"width={self.width},height={self.height},pixelformat=Y10P"])
         # Continuous raw stream to stdout (omit --stream-count => stream forever);
         # we read one frame at a time. stderr is kept for error diagnostics.
-        self._stderr = subprocess.PIPE
         self._proc = subprocess.Popen(
             ["v4l2-ctl", "-d", self.chain.video, "--stream-mmap",
              "--stream-to=-"],
@@ -197,6 +217,8 @@ class Camera:
 
     def capture_buffer(self) -> bytes:
         """Read one raw Y10P frame (packed) as bytes (handles partial pipe reads)."""
+        if self._cap is not None:
+            return self._cap.next_raw()
         if self._proc is None:
             raise RuntimeError("call start() first")
         chunks = bytearray()
@@ -216,6 +238,13 @@ class Camera:
         bit_depth=8  -> uint8  (the high byte of each pixel; fastest, OpenCV-ready)
         bit_depth=10 -> uint16 (full 10-bit value, 0..1023)
         """
+        if self._cap is not None:
+            # Unpack in Rust (GIL released) straight into the output buffer.
+            if self.bit_depth == 8:
+                buf = self._cap.next_u8()
+                return np.frombuffer(buf, np.uint8).reshape(self.height, self.width)
+            buf = self._cap.next_u16()
+            return np.frombuffer(buf, "<u2").reshape(self.height, self.width)
         return self.unpack(self.capture_buffer())
 
     def unpack(self, buf: bytes) -> np.ndarray:
@@ -229,6 +258,9 @@ class Camera:
         return (hi | lsb).reshape(self.height, self.width)
 
     def stop(self):
+        if self._cap is not None:
+            self._cap.close()
+            self._cap = None
         if self._proc is not None:
             self._proc.terminate()
             try:

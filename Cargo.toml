@@ -1,0 +1,18 @@
+[package]
+name = "rcam-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_native"
+path = "rust/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+libc = "0.2"
+opencv = "0.99.0"
+
+[profile.release]
+opt-level = 3
+lto = true

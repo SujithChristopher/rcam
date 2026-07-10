@@ -15,6 +15,24 @@ machine-vision sensor that ISP/3A machinery adds nothing, so `rcam` talks to
 V4L2 directly: **sensor controls on the subdev**, **frames from the CAMSS RDI**
 (format `Y10P`, MIPI-packed 10-bit) unpacked into NumPy.
 
+## Backends
+
+Capture has two interchangeable backends, picked automatically:
+
+- **native (Rust)** — a small PyO3 extension (`rcam._native`) that mmaps the
+  CAMSS multiplanar video node and runs `DQBUF` + Y10P unpack + `QBUF` with the
+  **GIL released**, so two cameras on two threads capture truly in parallel.
+  Built with `uv sync` (maturin build backend). Preferred when present.
+- **subprocess** — pipes frames from `v4l2-ctl --stream-mmap`; the fallback when
+  the extension isn't built. Works, but the GIL/IPC caps parallel throughput.
+
+Pass `Camera(..., native=False)` to force the subprocess path.
+
+At full resolution (1280x800) with minimum blanking the native path matches the
+raw kernel pipeline and scales linearly across both cameras — **~121 fps single,
+~241 fps aggregate in parallel**, with 8-bit unpacking essentially free. Re-run
+the table with `uv run python bench.py`.
+
 ## Setup
 
 ```bash
@@ -85,6 +103,8 @@ Raw control names also pass straight through, e.g.
 src/rcam/
   topology.py   discover sensors + capture chains from `media-ctl -p`
   camera.py     Camera class: configure / set_controls / capture_array
+rust/lib.rs     native V4L2 mmap backend (rcam._native, built by maturin)
 main.py         demo: snapshot from every camera
+bench.py        full-res FPS benchmark (single + parallel)
 ov9281/         hardware bring-up (overlay, driver, deploy scripts)
 ```

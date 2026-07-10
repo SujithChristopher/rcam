@@ -32,3 +32,4 @@ docs/*_files/
 
 # Claude Code local tooling
 .claude/
+/target/
