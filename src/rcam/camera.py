@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from typing import Any
 
 import numpy as np
@@ -39,6 +40,7 @@ _RAW_CTRLS = {
 }
 # Fixed sensor characteristics (read-only controls report these).
 _PIXEL_RATE = 160_000_000  # Hz
+_VBLANK_MAX = 51_540       # driver's vertical_blanking ceiling
 
 
 def _run(cmd: list[str]) -> str:
@@ -173,6 +175,58 @@ class Camera:
         hblank = self.get_control("horizontal_blanking")
         return (self.width + hblank) / _PIXEL_RATE * 1e6
 
+    def line_time_us(self) -> float:
+        """Time to read out one sensor row, in microseconds.
+
+        This is the quantum of every frame-timing adjustment: frame period,
+        exposure and the phase nudges in :mod:`rcam.sync` are all whole
+        numbers of lines. ~9.1 us at 1280 px wide with the default hblank.
+        """
+        return self._line_time_us()
+
+    def frame_period_us(self) -> float:
+        """Current sensor frame period (lines per frame x line time)."""
+        total_lines = self.height + self.get_control("vertical_blanking")
+        return total_lines * self._line_time_us()
+
+    def nudge_phase(self, delay_us: float, *, line_time_us: float | None = None,
+                    hold_s: float | None = None) -> float:
+        """Delay this sensor's free-running frame phase by ~``delay_us``.
+
+        The sensor has no phase control, but frame period = (height + vblank)
+        x line_time, so temporarily inflating ``vertical_blanking`` stretches
+        one frame and every frame after it lands that much later. Restoring
+        vblank returns to the original rate, phase-shifted.
+
+        Safe to call while another process/thread is streaming this camera:
+        the write goes to the sensor subdev, not the video node, and no
+        buffers are consumed here.
+
+        Returns the delay actually requested in microseconds (rounded to whole
+        lines and clipped to the driver's vblank range), which is what the
+        caller should feed back into its control loop.
+        """
+        lt = self._line_time_us() if line_time_us is None else line_time_us
+        vb0 = self.get_control("vertical_blanking")
+        lines = int(round(delay_us / lt))
+        if lines <= 0:
+            return 0.0
+        lines = min(lines, _VBLANK_MAX - vb0)
+        if lines <= 0:
+            return 0.0
+        # Hold the stretched period long enough for the sensor to latch it into
+        # at least one frame. Overshoot is fine and expected - the caller
+        # re-measures and iterates; what matters is that *some* known amount of
+        # extra time accrues, and the timestamps report exactly how much.
+        if hold_s is None:
+            hold_s = (self.height + vb0) * lt / 1e6 * 0.5
+        _run(["v4l2-ctl", "-d", self.sensor.subdev,
+              "--set-ctrl", f"vertical_blanking={vb0 + lines}"])
+        time.sleep(hold_s)
+        _run(["v4l2-ctl", "-d", self.sensor.subdev,
+              "--set-ctrl", f"vertical_blanking={vb0}"])
+        return lines * lt
+
     def _vblank_for_fps(self, fps: float) -> int:
         line_len = self.width + self.get_control("horizontal_blanking")
         total_lines = _PIXEL_RATE / line_len / fps
@@ -246,6 +300,40 @@ class Camera:
             buf = self._cap.next_u16()
             return np.frombuffer(buf, "<u2").reshape(self.height, self.width)
         return self.unpack(self.capture_buffer())
+
+    def capture_array_meta(self) -> tuple[np.ndarray, int | None, int | None]:
+        """``capture_array()`` plus the kernel's frame timestamp and sequence.
+
+        The timestamp is ``CLOCK_MONOTONIC`` nanoseconds stamped by CAMSS in
+        its frame-done interrupt (VIDIOC_DQBUF reports ts-monotonic/ts-src-eof),
+        so it shares a clock with ``time.monotonic_ns()`` but carries ~100 us of
+        jitter instead of the milliseconds a userspace arrival time picks up.
+        ``sequence`` is the driver's frame counter - a gap in it means the
+        sensor produced a frame that never reached us, which a wall-clock gap
+        alone cannot distinguish from this thread being descheduled.
+
+        Both are ``None`` on the v4l2-ctl fallback backend, which has no access
+        to the buffer header.
+        """
+        if self._cap is None:
+            return self.capture_array(), None, None
+        if self.bit_depth == 8:
+            buf, ts, seq = self._cap.next_u8_meta()
+            return (np.frombuffer(buf, np.uint8).reshape(self.height, self.width),
+                    ts, seq)
+        buf, ts, seq = self._cap.next_u16_meta()
+        return (np.frombuffer(buf, "<u2").reshape(self.height, self.width), ts, seq)
+
+    def capture_meta(self) -> tuple[int, int]:
+        """Wait for the next frame and return (timestamp_ns, sequence) only.
+
+        The pixels are discarded in Rust without being copied out - this is for
+        measuring frame cadence, where the image is not wanted and the 1.28 MB
+        copy would dominate the cost.
+        """
+        if self._cap is None:
+            raise RuntimeError("capture_meta() needs the native backend")
+        return self._cap.next_meta()
 
     def unpack(self, buf: bytes) -> np.ndarray:
         """Unpack MIPI Y10P (4 px per 5 bytes) to a HxW array."""

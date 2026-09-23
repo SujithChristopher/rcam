@@ -210,18 +210,44 @@ impl Capture {
     }
 
     fn next_raw<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let out = self.grab(py, 0)?;
+        let (out, _, _) = self.grab(py, 0)?;
         Ok(PyBytes::new(py, &out))
     }
 
     fn next_u8<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let out = self.grab(py, 1)?;
+        let (out, _, _) = self.grab(py, 1)?;
         Ok(PyBytes::new(py, &out))
     }
 
     fn next_u16<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let out = self.grab(py, 2)?;
+        let (out, _, _) = self.grab(py, 2)?;
         Ok(PyBytes::new(py, &out))
+    }
+
+    /// As next_raw/next_u8/next_u16, but also returning (timestamp_ns, sequence).
+    fn next_raw_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
+        let (out, ts, seq) = self.grab(py, 0)?;
+        Ok((PyBytes::new(py, &out), ts, seq))
+    }
+
+    fn next_u8_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
+        let (out, ts, seq) = self.grab(py, 1)?;
+        Ok((PyBytes::new(py, &out), ts, seq))
+    }
+
+    fn next_u16_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
+        let (out, ts, seq) = self.grab(py, 2)?;
+        Ok((PyBytes::new(py, &out), ts, seq))
+    }
+
+    /// Wait for the next frame and return only (timestamp_ns, sequence).
+    ///
+    /// The pixels are dropped without being copied out, which is what the
+    /// frame-phase measurement wants: it needs the cadence, not the image, and
+    /// at 1.28 MB/frame the copy would dominate.
+    fn next_meta(&self, py: Python<'_>) -> PyResult<(i64, u32)> {
+        let (_, ts, seq) = self.grab(py, 3)?;
+        Ok((ts, seq))
     }
 
     fn close(&mut self) {
@@ -293,12 +319,21 @@ impl Capture {
         Ok(())
     }
 
-    fn grab(&self, py: Python, mode: u8) -> PyResult<Vec<u8>> {
+    /// DQBUF one frame and return (pixels, buffer timestamp in ns, sequence).
+    ///
+    /// The timestamp is the one CAMSS stamps in its frame-done interrupt
+    /// (`ts-monotonic, ts-src-eof` per VIDIOC_DQBUF), i.e. the same clock as
+    /// Python's `time.monotonic_ns()` but taken in the kernel, so it carries
+    /// ~100us of jitter instead of the milliseconds a userspace arrival time
+    /// picks up. `sequence` is the driver's frame counter: a jump in it means
+    /// the sensor really produced a frame that never reached us, as opposed to
+    /// this thread merely having been descheduled.
+    fn grab(&self, py: Python, mode: u8) -> PyResult<(Vec<u8>, i64, u32)> {
         let fd = self.fd;
         let bufs = &self.buffers;
         let w = self.width;
         let h = self.height;
-        py.allow_threads(move || -> io::Result<Vec<u8>> {
+        py.allow_threads(move || -> io::Result<(Vec<u8>, i64, u32)> {
             let mut planes: [v4l2_plane; NUM_PLANES] = unsafe { std::mem::zeroed() };
             let mut b: v4l2_buffer = unsafe { std::mem::zeroed() };
             b.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -319,16 +354,20 @@ impl Capture {
                     unpack_u8(src, &mut d);
                     d
                 }
-                _ => {
+                2 => {
                     let mut d = vec![0u8; w * h * 2];
                     unpack_u16_le(src, &mut d);
                     d
                 }
+                _ => Vec::new(), // mode 3: timestamp/sequence only, no pixel copy
             };
+
+            let ts_ns = b.timestamp_sec * 1_000_000_000 + b.timestamp_usec * 1_000;
+            let seq = b.sequence;
 
             // requeue the same buffer
             unsafe { xioctl(fd, VIDIOC_QBUF, &mut b)? };
-            Ok(out)
+            Ok((out, ts_ns, seq))
         })
         .map_err(pyerr)
     }

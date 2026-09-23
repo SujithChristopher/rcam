@@ -6,9 +6,21 @@
         cam.set_controls({"ExposureLines": 600, "AnalogueGain": 4.0})
         frame = cam.capture_array()       # HxW uint8 numpy
 
+Two cameras free-run out of phase; :class:`rcam.FrameSync` walks one onto the
+other so both expose at the same instant.
+
 Requires the out-of-tree driver loaded:  sudo modprobe ov9282
 """
 from .camera import Camera, list_cameras
+from .sync import FrameSync, PhaseReport, phase_from_timestamps, wrap
 from .topology import parse as parse_topology
 
-__all__ = ["Camera", "list_cameras", "parse_topology"]
+__all__ = [
+    "Camera",
+    "list_cameras",
+    "parse_topology",
+    "FrameSync",
+    "PhaseReport",
+    "phase_from_timestamps",
+    "wrap",
+]
