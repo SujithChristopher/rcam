@@ -186,9 +186,19 @@ class Camera:
         """
         pairs: list[str] = []
         for key, val in controls.items():
-            if self._agc is not None and key.strip().lower() in _ISP_CTRLS:
-                self._set_isp_control(key.strip().lower(), val)
-                continue
+            if self._agc is not None:
+                # The AGC owns exposure and gain, so sensor writes of those
+                # would be undone next frame: route them to it as fixed values.
+                k = key.strip()
+                if k.lower() == "exposurelines" or k == "exposure":
+                    self._set_isp_control("exposuretime", int(val) * self._line_time_us())
+                    continue
+                if k == "analogue_gain":
+                    self._set_isp_control("analoguegain", int(val) / 16.0)
+                    continue
+                if k.lower() in _ISP_CTRLS:
+                    self._set_isp_control(k.lower(), val)
+                    continue
             pairs += self._translate(key, val)
         if pairs:
             _run(["v4l2-ctl", "-d", self.sensor.subdev,

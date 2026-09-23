@@ -33,3 +33,6 @@ docs/*_files/
 # Claude Code local tooling
 .claude/
 /target/
+
+# Experiment recordings (raw frame stacks, ~120 MB/s with two cameras)
+recordings/
