@@ -177,6 +177,76 @@ fn unpack_u16_le(src: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// Number of AGC metering zones per side (the Pi's 15x15 weight grid).
+const AGC_ZONES: usize = 15;
+/// Stats are gathered from every `STATS_STEP`th row and column.
+const STATS_STEP: usize = 2;
+
+/// Y10P -> u8 through a 1024-entry lookup table, gathering the AGC histogram
+/// on the way.
+///
+/// The LUT folds the whole Pi-style pixel pipeline (black level, digital
+/// gain, gamma) into one table lookup, so it costs no more than the plain
+/// high-byte unpack. The histogram is over the *raw* 10-bit codes - the
+/// statistics must describe the sensor output before digital gain, as the Pi
+/// frontend's do - with each sample counted `weights[zone]` times so the
+/// centre-weighted metering falls out of the histogram directly. Zones follow
+/// PiSP's layout: 15x15 even-sized cells centred on the frame, the remainder
+/// border unweighted.
+fn unpack_lut_stats(
+    src: &[u8],
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    lut: &[u8],
+    weights: &[u8],
+    hist: &mut [u32; 1024],
+) {
+    let stride = w * 10 / 8;
+    let zw = (w / AGC_ZONES) & !1;
+    let zh = (h / AGC_ZONES) & !1;
+    let ox = ((w - AGC_ZONES * zw) / 2) & !1;
+    let oy = ((h - AGC_ZONES * zh) / 2) & !1;
+    // Column -> zone column, or AGC_ZONES when outside the grid.
+    let colzone: Vec<usize> = (0..w)
+        .map(|x| if x < ox || zw == 0 { AGC_ZONES } else { ((x - ox) / zw).min(AGC_ZONES) })
+        .collect();
+    let mut wrow = vec![0u32; w];
+    let mut wrow_zone = usize::MAX;
+
+    for y in 0..h {
+        let s_row = y * stride;
+        if s_row + stride > src.len() {
+            break;
+        }
+        let srow = &src[s_row..s_row + stride];
+        let drow = &mut dst[y * w..(y + 1) * w];
+        let zy = if y < oy || zh == 0 { AGC_ZONES } else { ((y - oy) / zh).min(AGC_ZONES) };
+        let stats = y % STATS_STEP == 0 && zy < AGC_ZONES;
+        if stats && zy != wrow_zone {
+            for x in 0..w {
+                let zx = colzone[x];
+                wrow[x] = if zx < AGC_ZONES && x % STATS_STEP == 0 {
+                    weights[zy * AGC_ZONES + zx] as u32
+                } else {
+                    0
+                };
+            }
+            wrow_zone = zy;
+        }
+        for (g, (s, d)) in srow.chunks_exact(5).zip(drow.chunks_exact_mut(4)).enumerate() {
+            let lsb = s[4];
+            for k in 0..4 {
+                let v = ((s[k] as usize) << 2) | ((lsb >> (2 * k)) & 0x3) as usize;
+                d[k] = lut[v];
+                if stats {
+                    hist[v] += wrow[4 * g + k];
+                }
+            }
+        }
+    }
+}
+
 #[pyclass]
 struct Capture {
     fd: libc::c_int,
@@ -233,6 +303,33 @@ impl Capture {
     fn next_u8_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
         let (out, ts, seq) = self.grab(py, 1)?;
         Ok((PyBytes::new(py, &out), ts, seq))
+    }
+
+    /// Frame through the software ISP: returns
+    /// (u8 pixels mapped through `lut`, timestamp_ns, sequence, histogram)
+    /// where the histogram is 1024 little-endian u32 zone-weighted counts of
+    /// the raw 10-bit codes. See `unpack_lut_stats`.
+    fn next_isp<'py>(
+        &self,
+        py: Python<'py>,
+        lut: &[u8],
+        weights: &[u8],
+    ) -> PyResult<(Bound<'py, PyBytes>, i64, u32, Bound<'py, PyBytes>)> {
+        if lut.len() != 1024 || weights.len() != AGC_ZONES * AGC_ZONES {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lut must be 1024 bytes and weights 225 bytes",
+            ));
+        }
+        let lut = lut.to_vec();
+        let weights = weights.to_vec();
+        let mut hist = [0u32; 1024];
+        let (out, ts, seq) = self.grab_with(py, |src, w, h| {
+            let mut d = vec![0u8; w * h];
+            unpack_lut_stats(src, &mut d, w, h, &lut, &weights, &mut hist);
+            d
+        })?;
+        let hb: Vec<u8> = hist.iter().flat_map(|c| c.to_le_bytes()).collect();
+        Ok((PyBytes::new(py, &out), ts, seq, PyBytes::new(py, &hb)))
     }
 
     fn next_u16_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
@@ -329,6 +426,27 @@ impl Capture {
     /// the sensor really produced a frame that never reached us, as opposed to
     /// this thread merely having been descheduled.
     fn grab(&self, py: Python, mode: u8) -> PyResult<(Vec<u8>, i64, u32)> {
+        self.grab_with(py, |src, w, h| match mode {
+            0 => src.to_vec(),
+            1 => {
+                let mut d = vec![0u8; w * h];
+                unpack_u8(src, &mut d);
+                d
+            }
+            2 => {
+                let mut d = vec![0u8; w * h * 2];
+                unpack_u16_le(src, &mut d);
+                d
+            }
+            _ => Vec::new(), // mode 3: timestamp/sequence only, no pixel copy
+        })
+    }
+
+    /// DQBUF one frame, hand its packed bytes to `f` (GIL released), requeue.
+    fn grab_with<F>(&self, py: Python, f: F) -> PyResult<(Vec<u8>, i64, u32)>
+    where
+        F: FnOnce(&[u8], usize, usize) -> Vec<u8> + Send,
+    {
         let fd = self.fd;
         let bufs = &self.buffers;
         let w = self.width;
@@ -347,20 +465,7 @@ impl Capture {
             let used = (planes[0].bytesused as usize).min(len);
             let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, used) };
 
-            let out = match mode {
-                0 => src.to_vec(),
-                1 => {
-                    let mut d = vec![0u8; w * h];
-                    unpack_u8(src, &mut d);
-                    d
-                }
-                2 => {
-                    let mut d = vec![0u8; w * h * 2];
-                    unpack_u16_le(src, &mut d);
-                    d
-                }
-                _ => Vec::new(), // mode 3: timestamp/sequence only, no pixel copy
-            };
+            let out = f(src, w, h);
 
             let ts_ns = b.timestamp_sec * 1_000_000_000 + b.timestamp_usec * 1_000;
             let seq = b.sequence;

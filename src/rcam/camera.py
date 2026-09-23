@@ -16,16 +16,27 @@ Example
     cam.start()
     frame = cam.capture_array()      # HxW uint8 (or uint16 if bit_depth=10)
     cam.stop()
+
+Pi-style processing (auto exposure + black level + gamma, see :mod:`rcam.isp`):
+
+    cam.configure(size=(1280, 800), isp="pisp")   # or "vc4" for the Pi 4 curve
+    cam.start()
+    frame = cam.capture_array()      # looks like picamera2's output
+    cam.capture_metadata()           # {'ExposureTime': ..., 'AnalogueGain': ...}
 """
 from __future__ import annotations
 
+import fcntl
+import os
 import shutil
+import struct
 import subprocess
 import time
 from typing import Any
 
 import numpy as np
 
+from . import isp as _isp
 from .topology import CaptureChain, Sensor, parse
 
 try:
@@ -41,6 +52,18 @@ _RAW_CTRLS = {
 # Fixed sensor characteristics (read-only controls report these).
 _PIXEL_RATE = 160_000_000  # Hz
 _VBLANK_MAX = 51_540       # driver's vertical_blanking ceiling
+
+# VIDIOC_S_CTRL: the AGC writes exposure/gain every frame, too often for a
+# v4l2-ctl subprocess.
+_VIDIOC_S_CTRL = 0xC008561C
+_CID_EXPOSURE = 0x00980911
+_CID_ANALOGUE_GAIN = 0x009E0903
+
+# Controls that go to the software AGC / gamma when the ISP is on.
+_ISP_CTRLS = {
+    "aeenable", "exposuretime", "analoguegain", "gain", "exposurevalue",
+    "aeexposuremode", "aemeteringmode", "aeflickerperiod", "brightness", "contrast",
+}
 
 
 def _run(cmd: list[str]) -> str:
@@ -90,6 +113,15 @@ class Camera:
         self._proc: subprocess.Popen | None = None
         self._cap = None                       # _native.Capture when streaming
         self._frame_bytes = self.width * self.height * 10 // 8
+        self.isp: str | None = None
+        self._agc: _isp.Agc | None = None
+        self._brightness = 0.0
+        self._contrast = 1.0
+        self._subdev_fd = -1
+        # (first sequence it applies to, exposure_us, analogue_gain, digital_gain)
+        self._ctrl_history: list[tuple[int, float, float, float]] = []
+        self._last_seq = -1
+        self._metadata: dict[str, Any] = {}
 
     @staticmethod
     def _resolve(cam: str | int, sensors: list[Sensor]) -> Sensor:
@@ -106,10 +138,31 @@ class Camera:
         return _label(self.sensor)
 
     # -- configuration -----------------------------------------------------
-    def configure(self, size: tuple[int, int] = (1280, 800), *, bit_depth: int = 8):
-        """Set capture resolution and output depth (8 -> uint8, 10 -> uint16)."""
+    def configure(self, size: tuple[int, int] = (1280, 800), *, bit_depth: int = 8,
+                  isp: str | None = None):
+        """Set capture resolution and output depth (8 -> uint8, 10 -> uint16).
+
+        ``isp="pisp"`` (Pi 5) or ``"vc4"`` (Pi 4 and earlier) turns on the
+        Raspberry Pi-style processing from :mod:`rcam.isp`: auto exposure plus
+        black level, digital gain and gamma, so frames look like picamera2's.
+        Output is uint8. AE starts on, as on a Pi; ``ExposureTime`` /
+        ``AnalogueGain`` then pin that half of the exposure, and
+        ``AeEnable=False`` makes it fully manual.
+        """
         if bit_depth not in (8, 10):
             raise ValueError("bit_depth must be 8 or 10")
+        if isp is not None:
+            if isp not in _isp.GAMMA:
+                raise ValueError(f"isp must be one of {sorted(_isp.GAMMA)} or None")
+            if bit_depth != 8:
+                raise ValueError("isp output is 8-bit; use bit_depth=8")
+            if not self.native:
+                raise RuntimeError("isp needs the native backend (rcam._native)")
+            if self._agc is None:
+                self._agc = _isp.Agc(max_exposure_us=1e9)
+        else:
+            self._agc = None
+        self.isp = isp
         self.width, self.height = size
         self.bit_depth = bit_depth
         self._frame_bytes = self.width * self.height * 10 // 8
@@ -133,13 +186,50 @@ class Camera:
         """
         pairs: list[str] = []
         for key, val in controls.items():
+            if self._agc is not None and key.strip().lower() in _ISP_CTRLS:
+                self._set_isp_control(key.strip().lower(), val)
+                continue
             pairs += self._translate(key, val)
         if pairs:
             _run(["v4l2-ctl", "-d", self.sensor.subdev,
                   "--set-ctrl", ",".join(pairs)])
+            if self._agc is not None and self._subdev_fd >= 0:
+                # FrameRate / blanking moves the AGC's exposure ceiling.
+                vb = self.get_control("vertical_blanking")
+                self._agc.max_exposure_us = (
+                    self.height + vb - _isp.FRAME_INTEGRATION_DIFF) * self._line_us
         if settle and (self._proc is not None or self._cap is not None):
             self.flush()
         return self
+
+    def _set_isp_control(self, k: str, val: Any):
+        """picamera2 semantics for the AE / tone controls (ISP mode)."""
+        agc = self._agc
+        if k == "aeenable":
+            agc.enabled = bool(val)
+            if agc.enabled:
+                agc.fixed_exposure_us = agc.fixed_gain = 0.0
+        elif k == "exposuretime":
+            agc.fixed_exposure_us = float(val)       # 0 hands it back to the AGC
+        elif k in ("analoguegain", "gain"):
+            agc.fixed_gain = float(val)
+        elif k == "exposurevalue":
+            agc.ev = 2.0 ** float(val)
+        elif k == "aeexposuremode":
+            agc.exposure_mode = _isp.EXPOSURE_MODE_IDS.get(val, val)
+            if agc.exposure_mode not in _isp.EXPOSURE_MODES:
+                raise ValueError(f"unknown AeExposureMode {val!r}")
+        elif k == "aemeteringmode":
+            name = {0: "centre-weighted", 2: "average"}.get(val, val)
+            if name not in _isp.METERING_MODES:
+                raise ValueError(f"unknown AeMeteringMode {val!r}")
+            agc.metering_mode = name
+        elif k == "aeflickerperiod":
+            agc.flicker_period_us = float(val)
+        elif k == "brightness":
+            self._brightness = float(val)
+        elif k == "contrast":
+            self._contrast = float(val)
 
     def flush(self, n: int = 6):
         """Discard ``n`` queued frames (use after changing controls mid-stream)."""
@@ -250,6 +340,8 @@ class Camera:
         if shutil.which("media-ctl") is None:
             raise RuntimeError("media-ctl not found (install v4l-utils)")
         self._setup_pipeline()
+        if self._agc is not None:
+            self._isp_start()
         if self.native:
             # Rust mmap reader: opens the video node, sets Y10P, drives the
             # buffer queue itself. DQBUF/unpack/QBUF run with the GIL released,
@@ -292,6 +384,8 @@ class Camera:
         bit_depth=8  -> uint8  (the high byte of each pixel; fastest, OpenCV-ready)
         bit_depth=10 -> uint16 (full 10-bit value, 0..1023)
         """
+        if self._agc is not None and self._cap is not None:
+            return self._isp_frame()[0]
         if self._cap is not None:
             # Unpack in Rust (GIL released) straight into the output buffer.
             if self.bit_depth == 8:
@@ -317,6 +411,8 @@ class Camera:
         """
         if self._cap is None:
             return self.capture_array(), None, None
+        if self._agc is not None:
+            return self._isp_frame()
         if self.bit_depth == 8:
             buf, ts, seq = self._cap.next_u8_meta()
             return (np.frombuffer(buf, np.uint8).reshape(self.height, self.width),
@@ -335,6 +431,92 @@ class Camera:
             raise RuntimeError("capture_meta() needs the native backend")
         return self._cap.next_meta()
 
+    def capture_metadata(self) -> dict[str, Any]:
+        """Capture a frame and return its picamera2-style metadata (ISP mode)."""
+        if self._agc is None:
+            raise RuntimeError("capture_metadata() needs configure(isp=...)")
+        self._isp_frame()
+        return dict(self._metadata)
+
+    # -- software ISP ------------------------------------------------------
+    def _isp_start(self):
+        agc = self._agc
+        lt = self._line_time_us()
+        vb = self.get_control("vertical_blanking")
+        agc.min_exposure_us = lt
+        agc.max_exposure_us = (self.height + vb - _isp.FRAME_INTEGRATION_DIFF) * lt
+        agc.frame_count = 0
+        agc._filtered_total = 0.0
+        self._line_us = lt
+        # Start where the Pi does (1 ms, 1x) unless the user pinned values.
+        st = agc.status
+        st.exposure_us = agc.fixed_exposure_us or _isp.DEFAULT_EXPOSURE_US
+        st.analogue_gain = min(agc.fixed_gain or _isp.DEFAULT_GAIN, _isp.MAX_ANALOGUE_GAIN)
+        st.digital_gain = 1.0
+        if self._subdev_fd < 0:
+            self._subdev_fd = os.open(self.sensor.subdev, os.O_RDWR)
+        self._ctrl_history = []
+        self._last_seq = -1
+        self._write_exposure(st, applies_from=0)
+
+    def _write_exposure(self, st: _isp.AgcStatus, applies_from: int):
+        """Program the sensor and remember when the values take effect."""
+        lines = max(1, round(st.exposure_us / self._line_us))
+        code = min(255, max(16, int(st.analogue_gain * 16.0)))
+        prev = self._ctrl_history[-1] if self._ctrl_history else None
+        exp_us, again = lines * self._line_us, code / 16.0
+        # The sensor rounds exposure to lines and gain to 1/16; the Pi makes up
+        # the shortfall in digital gain so brightness stays on target.
+        dg = st.digital_gain * (st.exposure_us * st.analogue_gain) / (exp_us * again)
+        dg = min(max(dg, 1.0), _isp.MAX_DIGITAL_GAIN)
+        if prev is not None and prev[1:] == (exp_us, again, dg):
+            return
+        if prev is None or prev[1] != exp_us:
+            fcntl.ioctl(self._subdev_fd, _VIDIOC_S_CTRL, struct.pack("Ii", _CID_EXPOSURE, lines))
+        if prev is None or prev[2] != again:
+            fcntl.ioctl(self._subdev_fd, _VIDIOC_S_CTRL,
+                        struct.pack("Ii", _CID_ANALOGUE_GAIN, code))
+        self._ctrl_history.append((applies_from, exp_us, again, dg))
+        if len(self._ctrl_history) > 16:
+            del self._ctrl_history[:-16]
+
+    def _controls_for(self, seq: int) -> tuple[float, float, float]:
+        """(exposure_us, analogue_gain, digital_gain) frame ``seq`` was taken with."""
+        for first, exp_us, again, dg in reversed(self._ctrl_history):
+            if seq >= first:
+                return exp_us, again, dg
+        return self._ctrl_history[0][1:]
+
+    def _isp_frame(self) -> tuple[np.ndarray, int, int]:
+        agc = self._agc
+        # The LUT has to be chosen before the frame is dequeued; frames are
+        # consecutive in practice, and a mispredicted one is off for one frame.
+        _, _, dg = self._controls_for(self._last_seq + 1)
+        lut = _isp.build_lut(dg, gamma=self.isp, brightness=self._brightness,
+                             contrast=self._contrast)
+        buf, ts, seq, hist_b = self._cap.next_isp(lut.tobytes(), agc.weights.tobytes())
+        if self._last_seq < 0:
+            # First frame: anchor the startup controls to the real sequence.
+            first = self._ctrl_history[0]
+            self._ctrl_history[0] = (seq,) + first[1:]
+        self._last_seq = seq
+        exp_us, again, dg = self._controls_for(seq)
+        hist = _isp.Histogram(np.frombuffer(hist_b, "<u4"))
+        st = agc.process(hist, exp_us, again)
+        self._write_exposure(st, applies_from=seq + _isp.CONTROL_DELAY)
+        self._metadata = {
+            "ExposureTime": int(round(exp_us)),
+            "AnalogueGain": again,
+            "DigitalGain": dg,
+            "Lux": agc.lux,
+            "SensorTimestamp": ts,
+            "FrameSequence": seq,
+            "AeLocked": agc.frame_count > _isp.STARTUP_FRAMES and
+                        abs(st.total_exposure / (exp_us * again * dg) - 1) < 0.02,
+        }
+        frame = np.frombuffer(buf, np.uint8).reshape(self.height, self.width)
+        return frame, ts, seq
+
     def unpack(self, buf: bytes) -> np.ndarray:
         """Unpack MIPI Y10P (4 px per 5 bytes) to a HxW array."""
         g = np.frombuffer(buf, np.uint8).reshape(-1, 5)
@@ -346,6 +528,9 @@ class Camera:
         return (hi | lsb).reshape(self.height, self.width)
 
     def stop(self):
+        if self._subdev_fd >= 0:
+            os.close(self._subdev_fd)
+            self._subdev_fd = -1
         if self._cap is not None:
             self._cap.close()
             self._cap = None
