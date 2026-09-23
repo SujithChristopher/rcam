@@ -31,6 +31,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -64,6 +65,32 @@ _ISP_CTRLS = {
     "aeenable", "exposuretime", "analoguegain", "gain", "exposurevalue",
     "aeexposuremode", "aemeteringmode", "aeflickerperiod", "brightness", "contrast",
 }
+
+
+class _FramePool:
+    """Reuses frame arrays that the caller has let go of.
+
+    A fresh 1 MB array per frame costs ~1 ms in page faults and zeroing, more
+    than the unpack itself. An array is handed out again only once nothing
+    outside the pool refers to it (views count, as they hold their base), so
+    frames the caller keeps are never overwritten - the pool just grows.
+    """
+
+    _MAX = 16          # beyond this, frames the caller hoards are left to the GC
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+        self.arrays: list[np.ndarray] = []
+
+    def get(self) -> np.ndarray:
+        for a in self.arrays:
+            # References: the pool list, the loop variable, getrefcount's arg.
+            if sys.getrefcount(a) == 3:
+                return a
+        a = np.empty(self.shape, np.uint8)
+        if len(self.arrays) < self._MAX:
+            self.arrays.append(a)
+        return a
 
 
 def _run(cmd: list[str]) -> str:
@@ -122,6 +149,8 @@ class Camera:
         self._ctrl_history: list[tuple[int, float, float, float]] = []
         self._last_seq = -1
         self._metadata: dict[str, Any] = {}
+        self._pool: _FramePool | None = None
+        self._hist = np.zeros(1024, np.uint32)
 
     @staticmethod
     def _resolve(cam: str | int, sensors: list[Sensor]) -> Sensor:
@@ -397,10 +426,9 @@ class Camera:
         if self._agc is not None and self._cap is not None:
             return self._isp_frame()[0]
         if self._cap is not None:
-            # Unpack in Rust (GIL released) straight into the output buffer.
+            # Unpack in Rust (GIL released) straight into a reused array.
             if self.bit_depth == 8:
-                buf = self._cap.next_u8()
-                return np.frombuffer(buf, np.uint8).reshape(self.height, self.width)
+                return self._u8_frame()[0]
             buf = self._cap.next_u16()
             return np.frombuffer(buf, "<u2").reshape(self.height, self.width)
         return self.unpack(self.capture_buffer())
@@ -424,11 +452,19 @@ class Camera:
         if self._agc is not None:
             return self._isp_frame()
         if self.bit_depth == 8:
-            buf, ts, seq = self._cap.next_u8_meta()
-            return (np.frombuffer(buf, np.uint8).reshape(self.height, self.width),
-                    ts, seq)
+            return self._u8_frame()
         buf, ts, seq = self._cap.next_u16_meta()
         return (np.frombuffer(buf, "<u2").reshape(self.height, self.width), ts, seq)
+
+    def _frame_out(self) -> np.ndarray:
+        if self._pool is None or self._pool.shape != (self.height, self.width):
+            self._pool = _FramePool((self.height, self.width))
+        return self._pool.get()
+
+    def _u8_frame(self) -> tuple[np.ndarray, int, int]:
+        out = self._frame_out()
+        ts, seq = self._cap.next_u8_into(out)
+        return out, ts, seq
 
     def capture_meta(self) -> tuple[int, int]:
         """Wait for the next frame and return (timestamp_ns, sequence) only.
@@ -504,14 +540,16 @@ class Camera:
         _, _, dg = self._controls_for(self._last_seq + 1)
         lut = _isp.build_lut(dg, gamma=self.isp, brightness=self._brightness,
                              contrast=self._contrast)
-        buf, ts, seq, hist_b = self._cap.next_isp(lut.tobytes(), agc.weights.tobytes())
+        frame = self._frame_out()
+        ts, seq = self._cap.next_isp_into(frame, self._hist, lut.tobytes(),
+                                          agc.weights.tobytes())
         if self._last_seq < 0:
             # First frame: anchor the startup controls to the real sequence.
             first = self._ctrl_history[0]
             self._ctrl_history[0] = (seq,) + first[1:]
         self._last_seq = seq
         exp_us, again, dg = self._controls_for(seq)
-        hist = _isp.Histogram(np.frombuffer(hist_b, "<u4"))
+        hist = _isp.Histogram(self._hist)
         st = agc.process(hist, exp_us, again)
         self._write_exposure(st, applies_from=seq + _isp.CONTROL_DELAY)
         self._metadata = {
@@ -524,7 +562,6 @@ class Camera:
             "AeLocked": agc.frame_count > _isp.STARTUP_FRAMES and
                         abs(st.total_exposure / (exp_us * again * dg) - 1) < 0.02,
         }
-        frame = np.frombuffer(buf, np.uint8).reshape(self.height, self.width)
         return frame, ts, seq
 
     def unpack(self, buf: bytes) -> np.ndarray:

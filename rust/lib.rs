@@ -19,6 +19,7 @@ use std::io;
 
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
+use pyo3::buffer::PyBuffer;
 use pyo3::types::PyBytes;
 
 // ---- V4L2 constants (Linux uapi, aarch64 LP64) --------------------------
@@ -177,6 +178,19 @@ fn unpack_u16_le(src: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// Address of a writable, C-contiguous Python buffer of exactly `len` items.
+///
+/// Returned as a usize so the write can happen with the GIL released; the
+/// caller keeps the object alive for the duration of the call.
+fn writable_ptr<T: pyo3::buffer::Element>(buf: &PyBuffer<T>, len: usize) -> PyResult<usize> {
+    if buf.readonly() || !buf.is_c_contiguous() || buf.item_count() != len {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "output must be a writable C-contiguous buffer of {len} items"
+        )));
+    }
+    Ok(buf.buf_ptr() as usize)
+}
+
 /// Number of AGC metering zones per side (the Pi's 15x15 weight grid).
 const AGC_ZONES: usize = 15;
 /// Stats are gathered from every `STATS_STEP`th row and column.
@@ -332,6 +346,46 @@ impl Capture {
         Ok((PyBytes::new(py, &out), ts, seq, PyBytes::new(py, &hb)))
     }
 
+    /// next_u8, but unpacked straight into `out` (a reused H*W uint8 array)
+    /// instead of a fresh allocation: returns (timestamp_ns, sequence).
+    ///
+    /// Allocating 1 MB per frame costs ~1 ms in page faults and zeroing -
+    /// several times the unpack itself - so the hot path writes in place.
+    fn next_u8_into(&self, py: Python<'_>, out: PyBuffer<u8>) -> PyResult<(i64, u32)> {
+        let dst = writable_ptr(&out, self.width * self.height)?;
+        let (_, ts, seq) = self.grab_with(py, move |src, w, h| {
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, w * h) };
+            unpack_u8(src, d);
+        })?;
+        Ok((ts, seq))
+    }
+
+    /// next_isp, writing pixels into `out` (H*W uint8) and the histogram into
+    /// `hist` (1024 uint32) in place: returns (timestamp_ns, sequence).
+    fn next_isp_into(
+        &self,
+        py: Python<'_>,
+        out: PyBuffer<u8>,
+        hist: PyBuffer<u32>,
+        lut: &[u8],
+        weights: &[u8],
+    ) -> PyResult<(i64, u32)> {
+        if lut.len() != 1024 || weights.len() != AGC_ZONES * AGC_ZONES {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lut must be 1024 bytes and weights 225 bytes",
+            ));
+        }
+        let dst = writable_ptr(&out, self.width * self.height)?;
+        let hp = writable_ptr(&hist, 1024)?;
+        let (_, ts, seq) = self.grab_with(py, move |src, w, h| {
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, w * h) };
+            let hh = unsafe { &mut *(hp as *mut [u32; 1024]) };
+            hh.fill(0);
+            unpack_lut_stats(src, d, w, h, lut, weights, hh);
+        })?;
+        Ok((ts, seq))
+    }
+
     fn next_u16_meta<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyBytes>, i64, u32)> {
         let (out, ts, seq) = self.grab(py, 2)?;
         Ok((PyBytes::new(py, &out), ts, seq))
@@ -443,15 +497,16 @@ impl Capture {
     }
 
     /// DQBUF one frame, hand its packed bytes to `f` (GIL released), requeue.
-    fn grab_with<F>(&self, py: Python, f: F) -> PyResult<(Vec<u8>, i64, u32)>
+    fn grab_with<F, R>(&self, py: Python, f: F) -> PyResult<(R, i64, u32)>
     where
-        F: FnOnce(&[u8], usize, usize) -> Vec<u8> + Send,
+        F: FnOnce(&[u8], usize, usize) -> R + Send,
+        R: Send,
     {
         let fd = self.fd;
         let bufs = &self.buffers;
         let w = self.width;
         let h = self.height;
-        py.allow_threads(move || -> io::Result<(Vec<u8>, i64, u32)> {
+        py.allow_threads(move || -> io::Result<(R, i64, u32)> {
             let mut planes: [v4l2_plane; NUM_PLANES] = unsafe { std::mem::zeroed() };
             let mut b: v4l2_buffer = unsafe { std::mem::zeroed() };
             b.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
