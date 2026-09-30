@@ -145,19 +145,57 @@ fn pyerr(e: io::Error) -> PyErr {
     PyOSError::new_err(e.to_string())
 }
 
-#[inline]
+/// Y10P -> u8 (the high byte of each pixel): keep 4 of every 5 bytes.
 fn unpack_u8(src: &[u8], dst: &mut [u8]) {
-    let mut s = 0;
-    let mut d = 0;
-    let n = dst.len();
-    while d + 4 <= n && s + 5 <= src.len() {
-        dst[d] = src[s];
-        dst[d + 1] = src[s + 1];
-        dst[d + 2] = src[s + 2];
-        dst[d + 3] = src[s + 3];
-        s += 5;
-        d += 4;
+    let groups = (dst.len() / 4).min(src.len() / 5);
+    let done = unpack_u8_simd(&src[..groups * 5], &mut dst[..groups * 4]);
+    for (s, d) in src[done * 5..groups * 5]
+        .chunks_exact(5)
+        .zip(dst[done * 4..groups * 4].chunks_exact_mut(4))
+    {
+        d.copy_from_slice(&s[..4]);
     }
+}
+
+/// NEON body of `unpack_u8`; returns how many 5-byte groups it converted.
+///
+/// 80 input bytes (16 groups, 64 px) per step: five 16-byte loads, then four
+/// two-register table lookups each gather 16 high bytes from a 32-byte
+/// window. The windows start 0/16/32/48 bytes in, so pixel groups beginning
+/// at bytes 0/20/40/60 sit at offsets 0/4/8/12 within them - never reading
+/// past the 80 bytes, so no slack is needed at the end of the buffer.
+#[cfg(target_arch = "aarch64")]
+fn unpack_u8_simd(src: &[u8], dst: &mut [u8]) -> usize {
+    use std::arch::aarch64::*;
+    const IDX: [u8; 16] = [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18];
+    let steps = src.len() / 80;
+    unsafe {
+        let i0 = vld1q_u8(IDX.as_ptr());
+        let i4 = vaddq_u8(i0, vdupq_n_u8(4));
+        let i8 = vaddq_u8(i0, vdupq_n_u8(8));
+        let i12 = vaddq_u8(i0, vdupq_n_u8(12));
+        for n in 0..steps {
+            let p = src.as_ptr().add(n * 80);
+            let q = dst.as_mut_ptr().add(n * 64);
+            let (a, b, c, d, e) = (
+                vld1q_u8(p),
+                vld1q_u8(p.add(16)),
+                vld1q_u8(p.add(32)),
+                vld1q_u8(p.add(48)),
+                vld1q_u8(p.add(64)),
+            );
+            vst1q_u8(q, vqtbl2q_u8(uint8x16x2_t(a, b), i0));
+            vst1q_u8(q.add(16), vqtbl2q_u8(uint8x16x2_t(b, c), i4));
+            vst1q_u8(q.add(32), vqtbl2q_u8(uint8x16x2_t(c, d), i8));
+            vst1q_u8(q.add(48), vqtbl2q_u8(uint8x16x2_t(d, e), i12));
+        }
+    }
+    steps * 16
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn unpack_u8_simd(_src: &[u8], _dst: &mut [u8]) -> usize {
+    0
 }
 
 #[inline]
@@ -193,20 +231,27 @@ fn writable_ptr<T: pyo3::buffer::Element>(buf: &PyBuffer<T>, len: usize) -> PyRe
 
 /// Number of AGC metering zones per side (the Pi's 15x15 weight grid).
 const AGC_ZONES: usize = 15;
-/// Stats are gathered from every `STATS_STEP`th row and column.
-const STATS_STEP: usize = 2;
+/// Stats come from every `STATS_ROWS`th row and every other pixel along it:
+/// 1/8 of the frame, ~128k samples at 1280x800 - far more than the AGC's
+/// 1024-bin histogram needs to be stable, at a fraction of the cost.
+const STATS_ROWS: usize = 4;
 
 /// Y10P -> u8 through a 1024-entry lookup table, gathering the AGC histogram
 /// on the way.
 ///
 /// The LUT folds the whole Pi-style pixel pipeline (black level, digital
-/// gain, gamma) into one table lookup, so it costs no more than the plain
-/// high-byte unpack. The histogram is over the *raw* 10-bit codes - the
-/// statistics must describe the sensor output before digital gain, as the Pi
-/// frontend's do - with each sample counted `weights[zone]` times so the
-/// centre-weighted metering falls out of the histogram directly. Zones follow
-/// PiSP's layout: 15x15 even-sized cells centred on the frame, the remainder
-/// border unweighted.
+/// gain, gamma) into one table lookup. The histogram is over the *raw* 10-bit
+/// codes - the statistics must describe the sensor output before digital
+/// gain, as the Pi frontend's do - with each sample counted `weights[zone]`
+/// times so the centre-weighted metering falls out of the histogram directly.
+/// Zones follow PiSP's layout: 15x15 even-sized cells centred on the frame,
+/// the remainder border unweighted.
+///
+/// Speed: the tables are fixed-size arrays indexed by 10-bit values, so the
+/// compiler drops every bounds check; the per-row weights are looked up per
+/// 4-pixel group, not per pixel; and pixels 0 and 2 of each group count into
+/// separate histograms so back-to-back increments of the same bin (flat image
+/// areas) do not stall on each other.
 fn unpack_lut_stats(
     src: &[u8],
     dst: &mut [u8],
@@ -216,48 +261,65 @@ fn unpack_lut_stats(
     weights: &[u8],
     hist: &mut [u32; 1024],
 ) {
+    let lut: &[u8; 1024] = lut.try_into().expect("lut is 1024 entries");
     let stride = w * 10 / 8;
+    let groups = w / 4;
     let zw = (w / AGC_ZONES) & !1;
     let zh = (h / AGC_ZONES) & !1;
     let ox = ((w - AGC_ZONES * zw) / 2) & !1;
     let oy = ((h - AGC_ZONES * zh) / 2) & !1;
-    // Column -> zone column, or AGC_ZONES when outside the grid.
-    let colzone: Vec<usize> = (0..w)
-        .map(|x| if x < ox || zw == 0 { AGC_ZONES } else { ((x - ox) / zw).min(AGC_ZONES) })
-        .collect();
-    let mut wrow = vec![0u32; w];
+    let zone_of = |x: usize| {
+        if zw == 0 || x < ox { AGC_ZONES } else { ((x - ox) / zw).min(AGC_ZONES) }
+    };
+    // Per 4-pixel group: the column zones of its pixels 0 and 2.
+    let zcol: Vec<(usize, usize)> = (0..groups).map(|g| (zone_of(4 * g), zone_of(4 * g + 2))).collect();
+    let mut wrow = vec![(0u32, 0u32); groups];
     let mut wrow_zone = usize::MAX;
+    let mut h0 = [0u32; 1024];
+    let mut h2 = [0u32; 1024];
 
     for y in 0..h {
         let s_row = y * stride;
         if s_row + stride > src.len() {
             break;
         }
-        let srow = &src[s_row..s_row + stride];
-        let drow = &mut dst[y * w..(y + 1) * w];
-        let zy = if y < oy || zh == 0 { AGC_ZONES } else { ((y - oy) / zh).min(AGC_ZONES) };
-        let stats = y % STATS_STEP == 0 && zy < AGC_ZONES;
-        if stats && zy != wrow_zone {
-            for x in 0..w {
-                let zx = colzone[x];
-                wrow[x] = if zx < AGC_ZONES && x % STATS_STEP == 0 {
-                    weights[zy * AGC_ZONES + zx] as u32
-                } else {
-                    0
-                };
+        let srow = &src[s_row..s_row + groups * 5];
+        let drow = &mut dst[y * w..y * w + groups * 4];
+        let zy = if zh == 0 || y < oy { AGC_ZONES } else { ((y - oy) / zh).min(AGC_ZONES) };
+        let pairs = srow.chunks_exact(5).zip(drow.chunks_exact_mut(4));
+
+        if y % STATS_ROWS != 0 || zy >= AGC_ZONES {
+            for (s, d) in pairs {
+                let l = s[4] as usize;
+                d[0] = lut[((s[0] as usize) << 2 | (l & 3)) & 1023];
+                d[1] = lut[((s[1] as usize) << 2 | (l >> 2 & 3)) & 1023];
+                d[2] = lut[((s[2] as usize) << 2 | (l >> 4 & 3)) & 1023];
+                d[3] = lut[((s[3] as usize) << 2 | (l >> 6)) & 1023];
+            }
+            continue;
+        }
+        if zy != wrow_zone {
+            let wz = &weights[zy * AGC_ZONES..(zy + 1) * AGC_ZONES];
+            let wt = |zx: usize| if zx < AGC_ZONES { wz[zx] as u32 } else { 0 };
+            for (wg, &(z0, z2)) in wrow.iter_mut().zip(&zcol) {
+                *wg = (wt(z0), wt(z2));
             }
             wrow_zone = zy;
         }
-        for (g, (s, d)) in srow.chunks_exact(5).zip(drow.chunks_exact_mut(4)).enumerate() {
-            let lsb = s[4];
-            for k in 0..4 {
-                let v = ((s[k] as usize) << 2) | ((lsb >> (2 * k)) & 0x3) as usize;
-                d[k] = lut[v];
-                if stats {
-                    hist[v] += wrow[4 * g + k];
-                }
-            }
+        for ((s, d), &(w0, w2)) in pairs.zip(&wrow) {
+            let l = s[4] as usize;
+            let v0 = ((s[0] as usize) << 2 | (l & 3)) & 1023;
+            let v2 = ((s[2] as usize) << 2 | (l >> 4 & 3)) & 1023;
+            d[0] = lut[v0];
+            d[1] = lut[((s[1] as usize) << 2 | (l >> 2 & 3)) & 1023];
+            d[2] = lut[v2];
+            d[3] = lut[((s[3] as usize) << 2 | (l >> 6)) & 1023];
+            h0[v0] += w0;
+            h2[v2] += w2;
         }
+    }
+    for ((o, a), b) in hist.iter_mut().zip(&h0).zip(&h2) {
+        *o += a + b;
     }
 }
 
@@ -555,8 +617,36 @@ impl Drop for Capture {
     }
 }
 
+/// The Y10P -> u8 unpack on a caller-supplied packed frame (for tests).
+#[pyfunction(name = "unpack_u8")]
+fn py_unpack_u8<'py>(py: Python<'py>, src: &[u8], w: usize, h: usize) -> Bound<'py, PyBytes> {
+    let mut d = vec![0u8; w * h];
+    unpack_u8(src, &mut d);
+    PyBytes::new(py, &d)
+}
+
+/// The ISP unpack on a caller-supplied packed frame (for tests):
+/// returns (u8 pixels, 1024 little-endian u32 histogram).
+#[pyfunction(name = "unpack_isp")]
+fn py_unpack_isp<'py>(
+    py: Python<'py>,
+    src: &[u8],
+    w: usize,
+    h: usize,
+    lut: &[u8],
+    weights: &[u8],
+) -> (Bound<'py, PyBytes>, Bound<'py, PyBytes>) {
+    let mut d = vec![0u8; w * h];
+    let mut hist = [0u32; 1024];
+    unpack_lut_stats(src, &mut d, w, h, lut, weights, &mut hist);
+    let hb: Vec<u8> = hist.iter().flat_map(|c| c.to_le_bytes()).collect();
+    (PyBytes::new(py, &d), PyBytes::new(py, &hb))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Capture>()?;
+    m.add_function(wrap_pyfunction!(py_unpack_u8, m)?)?;
+    m.add_function(wrap_pyfunction!(py_unpack_isp, m)?)?;
     Ok(())
 }

@@ -151,6 +151,8 @@ class Camera:
         self._metadata: dict[str, Any] = {}
         self._pool: _FramePool | None = None
         self._hist = np.zeros(1024, np.uint32)
+        self._lut, self._lut_key = b"", None
+        self._weights, self._weights_key = b"", None
 
     @staticmethod
     def _resolve(cam: str | int, sensors: list[Sensor]) -> Sensor:
@@ -538,11 +540,18 @@ class Camera:
         # The LUT has to be chosen before the frame is dequeued; frames are
         # consecutive in practice, and a mispredicted one is off for one frame.
         _, _, dg = self._controls_for(self._last_seq + 1)
-        lut = _isp.build_lut(dg, gamma=self.isp, brightness=self._brightness,
-                             contrast=self._contrast)
+        # Digital gain only moves while the AGC is converging, so the table is
+        # rebuilt rarely; weights change only with the metering mode.
+        key = (dg, self.isp, self._brightness, self._contrast)
+        if key != self._lut_key:
+            self._lut = _isp.build_lut(dg, gamma=self.isp, brightness=self._brightness,
+                                       contrast=self._contrast).tobytes()
+            self._lut_key = key
+        if agc.metering_mode != self._weights_key:
+            self._weights = agc.weights.tobytes()
+            self._weights_key = agc.metering_mode
         frame = self._frame_out()
-        ts, seq = self._cap.next_isp_into(frame, self._hist, lut.tobytes(),
-                                          agc.weights.tobytes())
+        ts, seq = self._cap.next_isp_into(frame, self._hist, self._lut, self._weights)
         if self._last_seq < 0:
             # First frame: anchor the startup controls to the real sequence.
             first = self._ctrl_history[0]
