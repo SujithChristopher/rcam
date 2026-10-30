@@ -1,0 +1,8 @@
+rcam
+Copyright 2026 Sujith Christopher
+
+Licensed under the Apache License, Version 2.0 (see LICENSE), except for these
+files, which keep the licenses stated in their headers:
+
+  ov9281/module/ov9282.c      GPL-2.0-only (Linux kernel OV9282 driver)
+  ov9281/overlay/*.dtso       BSD-3-Clause

@@ -138,4 +138,6 @@ ov9281/         hardware bring-up (overlay, driver, deploy scripts)
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). The kernel driver in
+`ov9281/module/ov9282.c` stays GPL-2.0-only and the overlays in `ov9281/overlay/`
+BSD-3-Clause, as their headers say.
