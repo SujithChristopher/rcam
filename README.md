@@ -135,3 +135,7 @@ main.py         demo: snapshot from every camera
 bench.py        full-res FPS benchmark (single + parallel)
 ov9281/         hardware bring-up (overlay, driver, deploy scripts)
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

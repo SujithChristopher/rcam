@@ -3,6 +3,8 @@ name = "rcam"
 version = "0.1.0"
 description = "picamera2-style access to the OV9281 cameras on the Radxa Dragon Q6A"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.0",
