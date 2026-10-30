@@ -9,7 +9,7 @@
 Two cameras free-run out of phase; :class:`rcam.FrameSync` walks one onto the
 other so both expose at the same instant.
 
-Requires the out-of-tree driver loaded:  sudo modprobe ov9282
+Needs the sensors in the device tree; see the README's Install section.
 """
 from .camera import Camera, list_cameras
 from .sync import FrameSync, PhaseReport, phase_from_timestamps, wrap

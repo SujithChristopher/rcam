@@ -33,11 +33,37 @@ raw kernel pipeline and scales linearly across both cameras — **~121 fps singl
 ~241 fps aggregate in parallel**, with 8-bit unpacking essentially free. Re-run
 the table with `uv run python bench.py`.
 
-## Setup
+## Install
+
+Each [release](https://github.com/SujithChristopher/rcam/releases) carries a
+prebuilt wheel for aarch64 Linux (glibc ≥ 2.34) and Python ≥ 3.13, so no Rust
+toolchain is needed. Its only dependency is NumPy.
 
 ```bash
-sudo modprobe ov9282        # out-of-tree driver; once per boot (see note below)
-uv sync                     # installs rcam (editable) into .venv
+uv add https://github.com/SujithChristopher/rcam/releases/download/v0.1.0/rcam-0.1.0-cp312-abi3-manylinux_2_34_aarch64.whl
+# or: pip install <same URL>
+```
+
+The wheel is the userspace library only. The board also needs the cameras in its
+device tree — once per board, and again after every kernel update, which puts
+back the stock boot DTB. The release carries the compiled overlay
+(`qcs6490-radxa-dragon-q6a-dual-ov9281.dtbo`, CAM2 + CAM3):
+
+```bash
+git clone --branch v0.1.0 https://github.com/SujithChristopher/rcam && cd rcam/ov9281
+curl -L -o overlay/qcs6490-radxa-dragon-q6a-dual-ov9281.dtbo \
+  https://github.com/SujithChristopher/rcam/releases/download/v0.1.0/qcs6490-radxa-dragon-q6a-dual-ov9281.dtbo
+sudo scripts/deploy_efi_dtb.sh && sudo reboot
+```
+
+The `ov9282` driver ships in the stock RadxaOS kernel (7.0.11-6/-7-qcom) and
+loads by itself once the sensors are in the device tree. See
+[`ov9281/README.md`](ov9281/README.md) for the boot mechanism and recovery.
+
+## Development
+
+```bash
+uv sync                     # installs rcam (editable) + the bench/demo deps into .venv
 uv run python main.py       # captures cam2.png + cam3.png
 ```
 
@@ -89,9 +115,10 @@ Raw control names also pass straight through, e.g.
 
 - **Format is Y10P only.** The RDI advertises `GREY`/`Y10` but only `Y10P`
   actually streams; `rcam` unpacks it (8-bit fast path, or full 10-bit uint16).
-- **Driver auto-load:** `ov9282` is out-of-tree and not loaded at boot. Either
-  `sudo modprobe ov9282` each boot, or add `/etc/modules-load.d/ov9282.conf`
-  containing `ov9282` (persistent).
+- **Driver:** the stock RadxaOS kernel ships `ov9282` and it loads from the
+  device tree. Only an older kernel without it needs the out-of-tree build in
+  `ov9281/module/` (then `sudo modprobe ov9282`, or list it in
+  `/etc/modules-load.d/ov9282.conf`).
 - **After a kernel/image update** the EFI boot DTB reverts to stock (cameras
   disappear). Re-run `ov9281/scripts/deploy_efi_dtb.sh` and reboot.
 - **i2c bus numbers are not stable** across boots; `rcam` discovers sensors by

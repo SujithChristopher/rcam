@@ -5,9 +5,16 @@ description = "picamera2-style access to the OV9281 cameras on the Radxa Dragon 
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "matplotlib>=3.11.0",
-    "maturin>=1.14.1",
     "numpy>=2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/SujithChristopher/rcam"
+
+# For the demo, benchmarks and experiments in the repo, not the library.
+[dependency-groups]
+dev = [
+    "maturin>=1.14.1",
     "opencv-contrib-python>=4.13.0.92",
     "polars>=1.42.0",
     "rapidtag>=0.1.10",

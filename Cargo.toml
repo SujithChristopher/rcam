@@ -9,9 +9,8 @@ path = "rust/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py312"] }
 libc = "0.2"
-opencv = "0.99.0"
 
 [profile.release]
 opt-level = 3

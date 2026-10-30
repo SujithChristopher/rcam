@@ -36,3 +36,6 @@ docs/*_files/
 
 # Experiment recordings (raw frame stacks, ~120 MB/s with two cameras)
 recordings/
+
+# Built wheels / sdists (published as GitHub release assets)
+/dist/
